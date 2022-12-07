@@ -8,7 +8,7 @@
 * Related Document: See README.md
 *
 *******************************************************************************
-* Copyright 2021, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2021-2022, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -40,9 +40,9 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
-#include <config.h>
-#include <swap.h>
-#include <app.h>
+#include "config.h"
+#include "swap.h"
+#include "app.h"
 
 #define APP_PD_SWAP_RESP_ACCEPT         (0u)
 #define APP_PD_SWAP_RESP_REJECT         (1u)
@@ -208,8 +208,8 @@ void eval_fr_swap (cy_stc_pdstack_context_t context, cy_pdstack_app_resp_cbk_t a
     /* Always accept, FRS message will only be received if we have previously initiated a FRS signal. */
     app_req_status_t result = CY_PDSTACK_REQ_ACCEPT;
 
-    app_get_resp_buf(context)->reqStatus = result;
-    app_resp_handler(context, app_get_resp_buf(context));
+    app_get_resp_buf(context->port)->reqStatus = result;
+    app_resp_handler(context, app_get_resp_buf(context->port));
 
 }
 

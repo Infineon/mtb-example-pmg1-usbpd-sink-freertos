@@ -7,7 +7,7 @@
 * Related Document: See README.md
 *
 *******************************************************************************
-* Copyright 2021, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2021-2022, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -39,15 +39,15 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
-#include <cybsp.h>
-#include <config.h>
-#include <psink.h>
-#include <pdo.h>
-#include <swap.h>
-#include <vdm.h>
-#include <app.h>
-#include <cy_sw_timer.h>
-#include <cy_sw_timer_id.h>
+#include "cybsp.h"
+#include "config.h"
+#include "psink.h"
+#include "pdo.h"
+#include "swap.h"
+#include "vdm.h"
+#include "app.h"
+#include "cy_pdutils_sw_timer.h"
+#include "timer_id.h"
 #include "cy_usbpd_vbus_ctrl.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
@@ -183,7 +183,7 @@ static void app_handle_fault(cy_stc_pdstack_context_t * context, uint32_t fault_
          * Disable the port until configured timeout elapses.
          */
         Cy_PdStack_Dpm_Stop(context);
-        cy_sw_timer_start(context->timerContext, context, CY_PDSTACK_GET_APP_TIMER_ID(ptrPdStackContext, APP_FAULT_RECOVERY_TIMER),
+        Cy_PdUtils_SwTimer_Start(context->timerContext, context, GET_APP_TIMER_ID(ptrPdStackContext, APP_FAULT_RECOVERY_TIMER),
                 FAULT_RETRY_DELAY_MS, fault_delayed_recovery_timer_cb);
 #else /* !FAULT_RETRY_DELAY_EN */
 
@@ -208,7 +208,7 @@ static void app_handle_fault(cy_stc_pdstack_context_t * context, uint32_t fault_
         /*
          * Start a timer to try infinite fault recovery with a timeout.
          */
-        cy_sw_timer_start (context->timerContext, context, CY_PDSTACK_GET_APP_TIMER_ID(ptrPdStackContext, APP_FAULT_RECOVERY_TIMER),
+        Cy_PdUtils_SwTimer_Start (context->timerContext, context, GET_APP_TIMER_ID(ptrPdStackContext, APP_FAULT_RECOVERY_TIMER),
                 FAULT_INFINITE_RECOVERY_DELAY_MS, fault_delayed_recovery_timer_cb);
 #endif /* FAULT_INFINITE_RECOVERY_EN */
     }
@@ -253,8 +253,8 @@ static void fault_recovery_timer_cb(cy_timer_id_t id, void *context)
     }
 
     /* Restart the timer to check VBus and Rp status again. */
-    cy_sw_timer_start (callbackContext->ptrTimerContext, callbackContext,
-            CY_PDSTACK_GET_APP_TIMER_ID(callbackContext, APP_FAULT_RECOVERY_TIMER),
+    Cy_PdUtils_SwTimer_Start (callbackContext->ptrTimerContext, callbackContext,
+            GET_APP_TIMER_ID(callbackContext, APP_FAULT_RECOVERY_TIMER),
             period, fault_recovery_timer_cb);
 }
 
@@ -281,8 +281,8 @@ static void app_port_disable_cb(cy_stc_pdstack_context_t * context, cy_en_pdstac
     }
 
     /* Provide a delay to allow VBus turn-on by port partner and then enable the port. */
-    cy_sw_timer_start (context->ptrTimerContext, context,
-            CY_PDSTACK_GET_APP_TIMER_ID(context, APP_FAULT_RECOVERY_TIMER),
+    Cy_PdUtils_SwTimer_Start (context->ptrTimerContext, context,
+            GET_APP_TIMER_ID(context, APP_FAULT_RECOVERY_TIMER),
             period, fault_recovery_timer_cb);
 }
 
@@ -423,7 +423,7 @@ void app_ovp_enable(cy_stc_pdstack_context_t * context, uint16_t volt_mV, bool p
     uint8_t threshold;
 #endif /* VBUS_OVP_ADC_MODE_SUPPORTED */
 
-    uint8_t intr_state;
+    uint32_t intr_state;
     cy_stc_fault_vbus_ovp_cfg_t *ovp_config =
         (cy_stc_fault_vbus_ovp_cfg_t *) context->ptrUsbPdContext->usbpdConfig->vbusOvpConfig;
 
@@ -484,7 +484,7 @@ void app_ovp_disable(cy_stc_pdstack_context_t * context, bool pfet)
 /* Configure Under-Voltage Protection checks based on parameters in config table. */
 void app_uvp_enable(cy_stc_pdstack_context_t * context, uint16_t volt_mV, bool pfet, cy_cb_vbus_fault_t uvp_cb)
 {
-    uint8_t intr_state;
+    uint32_t intr_state;
     cy_stc_fault_vbus_uvp_cfg_t *uvp_config = context->ptrUsbPdContext->usbpdConfig->vbusUvpConfig;
 
     if (uvp_config->enable)

@@ -8,7 +8,7 @@
 *
 *
 *******************************************************************************
-* Copyright 2021, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2021-2022, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -40,12 +40,15 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
+#include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
+
 #include "cy_pdl.h"
-#include "cyhal.h"
 #include "cybsp.h"
 #include "config.h"
 
-#include "cy_sw_timer.h"
+#include "cy_pdutils_sw_timer.h"
 #include "cy_usbpd_common.h"
 #include "cy_pdstack_common.h"
 #include "cy_usbpd_typec.h"
@@ -63,10 +66,6 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
-#include <string.h>
-#include <stdarg.h>
-#include <stdio.h>
-
 
 #define LED_DELAY_MS                     500
 #define DPM_TASK_SEMA_TIMOUT_TICK        10
@@ -99,7 +98,7 @@ SemaphoreHandle_t gl_DpmPort1SemaHandle = NULL;
 /* LED blink rate in milliseconds */
 static uint16_t gl_LedBlinkRate = LED_TIMER_PERIOD_DETACHED;
 
-cy_stc_sw_timer_t        gl_TimerCtx;
+cy_stc_pdutils_sw_timer_t        gl_TimerCtx;
 cy_stc_usbpd_context_t   gl_UsbPdPort0Ctx;
 cy_stc_pdstack_context_t gl_PdStackPort0Ctx;
 
@@ -176,17 +175,6 @@ const cy_stc_sysint_t usbpd_port1_intr1_config =
 };
 #endif /* PMG1_PD_DUALPORT_ENABLE */
 
-const cyhal_uart_cfg_t uartConfig =
-{
-    .data_bits      = 8,
-    .stop_bits      = 1,
-    .parity         = CYHAL_UART_PARITY_NONE,
-    .rx_buffer      = NULL,
-    .rx_buffer_size = 0
-};
-
-cyhal_uart_t uartObj;
-
 cy_stc_pdstack_context_t *get_pdstack_context(uint8_t portIdx)
 {
     return (gl_PdStackContexts[portIdx]);
@@ -220,13 +208,13 @@ static void wdt_interrupt_handler(void)
     /* Clear WDT pending interrupt */
     Cy_WDT_ClearInterrupt();
 
-#if (TIMER_TICKLESS_ENABLE == 0)
+#if (CY_PDUTILS_TIMER_TICKLESS_ENABLE == 0)
     /* Load the timer match register. */
-    Cy_WDT_SetMatch((Cy_WDT_GetCount() + gl_TimerCtx.gl_multiplier))
+    Cy_WDT_SetMatch((Cy_WDT_GetCount() + gl_TimerCtx.multiplier));
 #endif /* (TIMER_TICKLESS_ENABLE == 0) */
 
     /* Invoke the timer handler. */
-    cy_sw_timer_interrupt_handler (&(gl_TimerCtx));
+    Cy_PdUtils_SwTimer_InterruptHandler (&(gl_TimerCtx));
 }
 
 static void cy_usbpd0_intr0_handler(void)
@@ -285,10 +273,12 @@ void led_timer_cb (
         void *callbackContext)       /**< Timer module Context. */
 {
     cy_stc_pdstack_context_t *stack_ctx = (cy_stc_pdstack_context_t *)callbackContext;
+#if BATTERY_CHARGING_ENABLE
     const chgdet_status_t    *chgdet_stat;
+#endif /* #if BATTERY_CHARGING_ENABLE */
 
     /* Toggle the User LED and re-start timer to schedule the next toggle event. */
-    cyhal_gpio_toggle(CYBSP_USER_LED);
+    Cy_GPIO_Inv(CYBSP_USER_LED_PORT, CYBSP_USER_LED_PIN);
 
     /* Calculate the desired LED blink rate based on the correct Type-C connection state. */
     if (stack_ctx->dpmConfig.attach)
@@ -299,21 +289,20 @@ void led_timer_cb (
         }
         else
         {
+#if BATTERY_CHARGING_ENABLE
             chgdet_stat = chgdet_get_status(stack_ctx);
             if (chgdet_stat->chgdet_fsm_state == CHGDET_FSM_SINK_DCP_CONNECTED)
             {
                 gl_LedBlinkRate = LED_TIMER_PERIOD_DCP_SRC;
             }
-            else
+            else if (chgdet_stat->chgdet_fsm_state == CHGDET_FSM_SINK_CDP_CONNECTED)
             {
-                if (chgdet_stat->chgdet_fsm_state == CHGDET_FSM_SINK_CDP_CONNECTED)
-                {
-                    gl_LedBlinkRate = LED_TIMER_PERIOD_CDP_SRC;
-                }
-                else
-                {
-                    gl_LedBlinkRate = LED_TIMER_PERIOD_TYPEC_SRC;
-                }
+                gl_LedBlinkRate = LED_TIMER_PERIOD_CDP_SRC;
+            }
+            else
+#endif /* BATTERY_CHARGING_ENABLE */
+            {
+                gl_LedBlinkRate = LED_TIMER_PERIOD_TYPEC_SRC;
             }
         }
     }
@@ -322,7 +311,7 @@ void led_timer_cb (
         gl_LedBlinkRate = LED_TIMER_PERIOD_DETACHED;
     }
 
-    cy_sw_timer_start (&gl_TimerCtx, callbackContext, id, gl_LedBlinkRate, led_timer_cb);
+    Cy_PdUtils_SwTimer_Start (&gl_TimerCtx, callbackContext, id, gl_LedBlinkRate, led_timer_cb);
 }
 #endif /* APP_FW_LED_ENABLE */
 
@@ -553,9 +542,11 @@ void Instrumentation_Task(void *param)
         {
             stringSize = snprintf(string, 32, "A:%u D:%u F:%u", (unsigned int)gl_APPTaskCount,
                                             (unsigned int)gl_DPMTaskCount, (unsigned int)gl_FaultTaskCount);
-            cyhal_uart_write(&uartObj, (void *)string, &stringSize);
-            stringSize= 2;
-            cyhal_uart_write(&uartObj, (void *)"\r\n", &stringSize);
+            (void)stringSize;
+            
+            Cy_SCB_UART_PutString(CYBSP_UART_HW, string);
+            
+            Cy_SCB_UART_PutString(CYBSP_UART_HW, (void *)"\r\n");
 
             preAppTaskCount = gl_APPTaskCount;
             preDpmTaskCount = gl_DPMTaskCount;
@@ -585,9 +576,10 @@ void vApplicationIdleHook()
 int main(void)
 {
     cy_rslt_t result;
+    cy_stc_pdutils_timer_config_t timerConfig;
+    cy_stc_scb_uart_context_t CYBSP_UART_context;
 
     const char string[] = "Scheduler Started\r\n";
-    size_t stringSize = strlen(string);
     /* Initialize the device and board peripherals */
     result = cybsp_init() ;
     if (result != CY_RSLT_SUCCESS)
@@ -602,8 +594,11 @@ int main(void)
     Cy_SysInt_Init(&wdt_interrupt_config, &wdt_interrupt_handler);
     NVIC_EnableIRQ(wdt_interrupt_config.intrSrc);
 
+    timerConfig.sys_clk_freq = Cy_SysClk_ClkSysGetFrequency();
+    timerConfig.hw_timer_ctx = NULL;
+
     /* Initialize the soft timer module. */
-    cy_sw_timer_init(&gl_TimerCtx, Cy_SysClk_ClkSysGetFrequency());
+    Cy_PdUtils_SwTimer_Init(&gl_TimerCtx, &timerConfig);
 
     xTaskCreate(Instrumentation_Task, "Instrumentation Task", (configMINIMAL_STACK_SIZE*2) , NULL, 1 , &gl_InstTaskHandle) ;
     xTaskCreate(PdStack_Dpm_Port0_Task, "DPM Port0 Task", configMINIMAL_STACK_SIZE , NULL, 1 , &gl_DpmPort0TaskHandle) ;
@@ -631,10 +626,11 @@ int main(void)
     {
         CY_ASSERT(0);
     }
-#endif // PMG1_PD_DUALPORT_ENABLE
+#endif /* PMG1_PD_DUALPORT_ENABLE */
 
-    /* Configure and enable the UART peripheral. */
-    cyhal_uart_init(&uartObj, CYBSP_DEBUG_UART_TX, CYBSP_DEBUG_UART_RX, NULL, &uartConfig);
+    /* Configure and enable the UART peripheral */
+    Cy_SCB_UART_Init(CYBSP_UART_HW, &CYBSP_UART_config, &CYBSP_UART_context);
+    Cy_SCB_UART_Enable(CYBSP_UART_HW);
 
     /* Enable global interrupts */
     __enable_irq();
@@ -722,11 +718,8 @@ int main(void)
 #endif /* PMG1_PD_DUALPORT_ENABLE */
 
 #if APP_FW_LED_ENABLE
-    /* Configure LED pin as a strong drive output */
-    cyhal_gpio_init(CYBSP_USER_LED, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, false);
-
     /* Start a timer that will blink the FW ACTIVE LED. */
-    cy_sw_timer_start (&gl_TimerCtx, (void *)&gl_PdStackPort0Ctx, (cy_timer_id_t)LED_TIMER_ID,
+    Cy_PdUtils_SwTimer_Start (&gl_TimerCtx, (void *)&gl_PdStackPort0Ctx, (cy_timer_id_t)LED_TIMER_ID,
             gl_LedBlinkRate, led_timer_cb);
 #endif /* APP_FW_LED_ENABLE */
 
@@ -735,7 +728,7 @@ int main(void)
      * Since this application does not have any other function, the PMG1 device can be placed in "deep sleep"
      * mode for power saving whenever the PD stack and drivers are idle.
      */
-    cyhal_uart_write_async(&uartObj, (void *)string, stringSize);
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, string);
 
     vTaskStartScheduler();
 

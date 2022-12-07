@@ -8,7 +8,7 @@
 * Related Document: See README.md
 *
 *******************************************************************************
-* Copyright 2021, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2021-2022, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -48,10 +48,10 @@
  ******************************************************************************/
 
 #include <stdint.h>
-#include <config.h>
-#include <cy_usbpd_vbus_ctrl.h>
-#include <cy_usbpd_typec.h>
-#include <cy_pdstack_dpm.h>
+#include "config.h"
+#include "cy_usbpd_vbus_ctrl.h"
+#include "cy_usbpd_typec.h"
+#include "cy_pdstack_dpm.h"
 
 /*******************************************************************************
  * MACRO Definition
@@ -274,7 +274,7 @@ bool vconn_is_present(cy_stc_pdstack_context_t *ptrPdStackContext);
  *
  * @return true if power is present on VBus, else returns false
  */
-bool vbus_is_present(cy_stc_pdstack_context_t *ptrPdStackContext, uint16_t volt, int8 per);
+bool vbus_is_present(cy_stc_pdstack_context_t *ptrPdStackContext, uint16_t volt, int8_t per);
 
 /**
  * @brief This function return current VBUS voltage in mV
@@ -286,7 +286,7 @@ bool vbus_is_present(cy_stc_pdstack_context_t *ptrPdStackContext, uint16_t volt,
 uint16_t vbus_get_value(cy_stc_pdstack_context_t *ptrPdStackContext);
 
 /**
- * @brief This function turns on dischange FET on selected port
+ * @brief This function turns on discharge FET on selected port
  *
  * @param port Port index the function is performed for.
  *
@@ -295,7 +295,7 @@ uint16_t vbus_get_value(cy_stc_pdstack_context_t *ptrPdStackContext);
 void vbus_discharge_on(cy_stc_pdstack_context_t* context);
 
 /**
- * @brief This function turns off dischange FET on selected port
+ * @brief This function turns off discharge FET on selected port
  *
  * @param port Port index the function is performed for.
  *

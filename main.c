@@ -8,7 +8,7 @@
 *
 *
 *******************************************************************************
-* Copyright 2021-2022, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2021-2024, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -40,10 +40,13 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
+
+/*******************************************************************************
+ * Include header files
+ ******************************************************************************/
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
-
 #include "cy_pdl.h"
 #include "cybsp.h"
 #include "config.h"
@@ -55,54 +58,95 @@
 #include "cy_pdstack_dpm.h"
 #include "cy_usbpd_vbus_ctrl.h"
 #include "cy_usbpd_phy.h"
-#include "instrumentation.h"
-#include "app.h"
-#include "pdo.h"
-#include "psink.h"
-#include "swap.h"
-#include "vdm.h"
-#include "charger_detect.h"
+#include "cy_app_instrumentation.h"
+#include "cy_app_fault_handlers.h"
+#include "cy_app.h"
+#include "cy_app_pdo.h"
+#include "cy_app_sink.h"
+#include "cy_app_swap.h"
+#include "cy_app_vdm.h"
+#include "cy_app_battery_charging.h"
 #include "mtbcfg_ezpd.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#include "cyabs_rtos.h"
 
+/*******************************************************************************
+* Macro definitions
+*******************************************************************************/
 #define LED_DELAY_MS                     500
 #define DPM_TASK_SEMA_TIMOUT_TICK        10
 #define APP_TASK_SEMA_TIMOUT_TICK        20
 #define INST_TASK_DELAY_MS               100
 
-/* Task handle used for app tasks variables */
-TaskHandle_t gl_InstTaskHandle = NULL;
-TaskHandle_t gl_DpmPort0TaskHandle = NULL;
-TaskHandle_t gl_AppPort0TaskHandle = NULL;
-TaskHandle_t gl_FaultPort0TaskHandle = NULL;
+#define INST_TASK_PRIORITY              (tskIDLE_PRIORITY + 1)
+#define DPM_TASK_PRIORITY               (tskIDLE_PRIORITY + 3)
+#define APP_TASK_PRIORITY               (tskIDLE_PRIORITY + 2)
 
-/* Semaphore handle used for DPM sync */
-SemaphoreHandle_t     gl_DpmPort0SemaHandle = NULL;
+#define INST_TASK_STACK_SIZE            (configMINIMAL_STACK_SIZE*2)
+#define DPM_TASK_STACK_SIZE             (configMINIMAL_STACK_SIZE*4)
+#define APP_TASK_STACK_SIZE             (configMINIMAL_STACK_SIZE*2)
 
+#define UART_TIMEOUT_COUNT              (3000)
+
+/* Structure to hold the user LED status. */
+typedef struct
+{
+    GPIO_PRT_Type* gpioPort;     /* User LED port base address */
+    uint32_t gpioPin;            /* User LED pin GPIO number */
+    uint16_t blinkRate;        /* User LED blink rate in millisecond */
+}cy_stc_user_led_status;
+
+/*******************************************************************************
+* Global Variables
+*******************************************************************************/
+/* Variable used for logging the task execution count. */
 uint32_t gl_DPMTaskCount = 0;
 uint32_t gl_APPTaskCount = 0;
-uint32_t gl_FaultTaskCount = 0;
+uint32_t gl_preAppTaskCount = 0;
+uint32_t gl_preDpmTaskCount = 0;
+
+/* Instrumentation task handler. */
+TaskHandle_t gl_InstTaskHandle = NULL;
+
+/* Semaphore handle used by the instrumentation task. */
+SemaphoreHandle_t gl_InstSemaHandle = NULL;
+
+/* Task handler used for port-0 tasks */
+TaskHandle_t gl_DpmPort0TaskHandle = NULL;
+TaskHandle_t gl_AppPort0TaskHandle = NULL;
+
+/* Semaphore handle used for port-0 DPM sync */
+SemaphoreHandle_t gl_DpmPort0SemaHandle = NULL;
 
 #if PMG1_PD_DUALPORT_ENABLE
-/* Task handle used for app tasks variables */
+/* Task handler used for port-1 app tasks variables */
 TaskHandle_t gl_DpmPort1TaskHandle = NULL;
 TaskHandle_t gl_AppPort1TaskHandle = NULL;
-TaskHandle_t gl_FaultPort1TaskHandle = NULL;
 
-/* Semaphore handle used for DPM sync */
+/* Semaphore handle used for port-1 DPM sync */
 SemaphoreHandle_t gl_DpmPort1SemaHandle = NULL;
 #endif
 
-/* LED blink rate in milliseconds */
-static uint16_t gl_LedBlinkRate = LED_TIMER_PERIOD_DETACHED;
+/* Variable to store the user LED status */
+static cy_stc_user_led_status gl_userLedStatus[NO_OF_TYPEC_PORTS] =
+{
+        {CYBSP_USER_LED1_PORT, CYBSP_USER_LED1_PIN, LED_TIMER_PERIOD_DETACHED},
+#if PMG1_PD_DUALPORT_ENABLE
+        {CYBSP_USER_LED2_PORT, CYBSP_USER_LED2_PIN, LED_TIMER_PERIOD_DETACHED},
+#endif /* PMG1_PD_DUALPORT_ENABLE */
+};
 
-cy_stc_pdutils_sw_timer_t        gl_TimerCtx;
-cy_stc_usbpd_context_t   gl_UsbPdPort0Ctx;
+/* Software timer context variable. */
+cy_stc_pdutils_sw_timer_t gl_TimerCtx;
+
+/* USB-PD and PdStack context variable for port-0. */
+cy_stc_usbpd_context_t gl_UsbPdPort0Ctx;
 cy_stc_pdstack_context_t gl_PdStackPort0Ctx;
 
 #if PMG1_PD_DUALPORT_ENABLE
+/* USB-PD and PdStack context variable for port-1. */
 cy_stc_usbpd_context_t gl_UsbPdPort1Ctx;
 cy_stc_pdstack_context_t gl_PdStackPort1Ctx;
 #endif /* PMG1_PD_DUALPORT_ENABLE */
@@ -128,6 +172,31 @@ const cy_stc_pdstack_dpm_params_t pdstack_port1_dpm_params =
     .defCur = 90
 };
 #endif /* PMG1_PD_DUALPORT_ENABLE */
+
+uint32_t gl_discIdRespPort0[7] = {0xFF00A841, 0x184004B4, 0x00000000, 0xF5000000};
+
+const cy_stc_app_params_t port0_app_params =
+{
+    .appVbusPollAdcId = APP_VBUS_POLL_ADC_ID,
+    .appVbusPollAdcInput = APP_VBUS_POLL_ADC_INPUT,
+    .discIdResp = (cy_pd_pd_do_t *)&gl_discIdRespPort0[0],
+    .discIdLen = 0x14,
+    .swapResponse = 0x3F
+};
+
+#if PMG1_PD_DUALPORT_ENABLE
+uint32_t gl_discIdRespPort1[7] = {0xFF00A841, 0x184004B4, 0x00000000, 0xF5000000};
+
+const cy_stc_app_params_t port1_app_params =
+{
+    .appVbusPollAdcId = APP_VBUS_POLL_ADC_ID,
+    .appVbusPollAdcInput = APP_VBUS_POLL_ADC_INPUT,
+    .discIdResp = (cy_pd_pd_do_t *)&gl_discIdRespPort1[0],
+    .discIdLen = 0x14,
+    .swapResponse = 0x3F
+};
+#endif /* PMG1_PD_DUALPORT_ENABLE */
+
 cy_stc_pdstack_context_t * gl_PdStackContexts[NO_OF_TYPEC_PORTS] =
 {
     &gl_PdStackPort0Ctx,
@@ -136,6 +205,9 @@ cy_stc_pdstack_context_t * gl_PdStackContexts[NO_OF_TYPEC_PORTS] =
 #endif /* PMG1_PD_DUALPORT_ENABLE */
 };
 
+/*******************************************************************************
+* Function Definition
+*******************************************************************************/
 bool mux_ctrl_init(uint8_t port)
 {
     /* No MUXes to be controlled on the PMG1 proto kits. */
@@ -175,34 +247,81 @@ const cy_stc_sysint_t usbpd_port1_intr1_config =
 };
 #endif /* PMG1_PD_DUALPORT_ENABLE */
 
+/*******************************************************************************
+* Function Name: get_pdstack_context
+********************************************************************************
+* Summary:
+*   Returns the respective port PD Stack Context
+*
+* Parameters:
+*  portIdx - Port Index
+*
+* Return:
+*  cy_stc_pdstack_context_t
+*
+*******************************************************************************/
 cy_stc_pdstack_context_t *get_pdstack_context(uint8_t portIdx)
 {
     return (gl_PdStackContexts[portIdx]);
 }
 
-/* Solution PD event handler */
+/*******************************************************************************
+* Function Name: sln_pd_event_handler
+********************************************************************************
+* Summary:
+*   Solution PD Event Handler
+*   Handles the Extended message event
+*
+* Parameters:
+*  ctx - PD Stack Context
+*  evt - App Event
+*  data - Data
+*
+* Return:
+*  None
+*
+*******************************************************************************/
 void sln_pd_event_handler(cy_stc_pdstack_context_t* ctx, cy_en_pdstack_app_evt_t evt, const void *data)
 {
     (void)ctx;
-
-    if(evt == APP_EVT_HANDLE_EXTENDED_MSG)
-    {
-        cy_stc_pd_packet_extd_t * ext_mes = (cy_stc_pd_packet_extd_t * )data;
-        if ((ext_mes->msg != CY_PDSTACK_EXTD_MSG_SECURITY_RESP) && (ext_mes->msg != CY_PDSTACK_EXTD_MSG_FW_UPDATE_RESP))
-        {
-            /* Send Not supported message */
-            Cy_PdStack_Dpm_SendPdCommand(ctx, CY_PDSTACK_DPM_CMD_SEND_NOT_SUPPORTED, NULL, true, NULL);
-        }
-    }
+    (void)evt;
+    (void)data;
 }
 
-void instrumentation_cb(uint8_t port, inst_evt_t evt)
+/*******************************************************************************
+* Function Name: instrumentation_cb
+********************************************************************************
+* Summary:
+*  Callback function for handling instrumentation faults
+*
+* Parameters:
+*  port - Port
+*  evt - Event
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+void instrumentation_cb(uint8_t port, uint8_t evt)
 {
     uint8_t evt_offset = APP_TOTAL_EVENTS;
     evt += evt_offset;
     sln_pd_event_handler(&gl_PdStackPort0Ctx, (cy_en_pdstack_app_evt_t)evt, NULL);
 }
 
+/*******************************************************************************
+* Function Name: wdt_interrupt_handler
+********************************************************************************
+* Summary:
+*  Interrupt Handler for Watch Dog Timer
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
 static void wdt_interrupt_handler(void)
 {
     /* Clear WDT pending interrupt */
@@ -217,6 +336,19 @@ static void wdt_interrupt_handler(void)
     Cy_PdUtils_SwTimer_InterruptHandler (&(gl_TimerCtx));
 }
 
+/*******************************************************************************
+* Function Name: cy_usbpd0_intr0_handler
+********************************************************************************
+* Summary:
+*  Interrupt Handler for USBPD0 Interrupt 0
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
 static void cy_usbpd0_intr0_handler(void)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -229,6 +361,19 @@ static void cy_usbpd0_intr0_handler(void)
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
+/*******************************************************************************
+* Function Name: cy_usbpd0_intr1_handler
+********************************************************************************
+* Summary:
+*  Interrupt Handler for USBPD0 Interrupt 1
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
 static void cy_usbpd0_intr1_handler(void)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -242,6 +387,19 @@ static void cy_usbpd0_intr1_handler(void)
 }
 
 #if PMG1_PD_DUALPORT_ENABLE
+/*******************************************************************************
+* Function Name: cy_usbpd1_intr0_handler
+********************************************************************************
+* Summary:
+*  Interrupt Handler for USBPD1 Interrupt 0
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
 static void cy_usbpd1_intr0_handler(void)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -254,6 +412,19 @@ static void cy_usbpd1_intr0_handler(void)
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
+/*******************************************************************************
+* Function Name: cy_usbpd1_intr1_handler
+********************************************************************************
+* Summary:
+*  Interrupt Handler for USBPD1 Interrupt 1
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
 static void cy_usbpd1_intr1_handler(void)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -268,59 +439,108 @@ static void cy_usbpd1_intr1_handler(void)
 #endif /* PMG1_PD_DUALPORT_ENABLE */
 
 #if APP_FW_LED_ENABLE
+/*******************************************************************************
+* Function Name: led_timer_cb
+********************************************************************************
+* Summary:
+*  Sets the desired LED blink rate based on the Type-C connection
+*
+* Parameters:
+*  id - Timer ID
+*  callbackContext - Context
+*
+* Return:
+*  None
+*
+*******************************************************************************/
 void led_timer_cb (
         cy_timer_id_t id,            /**< Timer ID for which callback is being generated. */
         void *callbackContext)       /**< Timer module Context. */
 {
     cy_stc_pdstack_context_t *stack_ctx = (cy_stc_pdstack_context_t *)callbackContext;
+    cy_stc_user_led_status *user_led = &gl_userLedStatus[stack_ctx->port];
 #if BATTERY_CHARGING_ENABLE
-    const chgdet_status_t    *chgdet_stat;
+    const cy_stc_bc_status_t    *bc_stat;
 #endif /* #if BATTERY_CHARGING_ENABLE */
 
     /* Toggle the User LED and re-start timer to schedule the next toggle event. */
-    Cy_GPIO_Inv(CYBSP_USER_LED_PORT, CYBSP_USER_LED_PIN);
+    Cy_GPIO_Inv(user_led->gpioPort, user_led->gpioPin);
 
     /* Calculate the desired LED blink rate based on the correct Type-C connection state. */
     if (stack_ctx->dpmConfig.attach)
     {
         if (stack_ctx->dpmConfig.contractExist)
         {
-            gl_LedBlinkRate = LED_TIMER_PERIOD_PD_SRC;
+            user_led->blinkRate = LED_TIMER_PERIOD_PD_SRC;
         }
         else
         {
 #if BATTERY_CHARGING_ENABLE
-            chgdet_stat = chgdet_get_status(stack_ctx);
-            if (chgdet_stat->chgdet_fsm_state == CHGDET_FSM_SINK_DCP_CONNECTED)
+            bc_stat = Cy_App_Bc_GetStatus(stack_ctx->ptrUsbPdContext);
+            if (bc_stat->bc_fsm_state == BC_FSM_SINK_DCP_CONNECTED)
             {
-                gl_LedBlinkRate = LED_TIMER_PERIOD_DCP_SRC;
+                user_led->blinkRate = LED_TIMER_PERIOD_DCP_SRC;
             }
-            else if (chgdet_stat->chgdet_fsm_state == CHGDET_FSM_SINK_CDP_CONNECTED)
+            else if (bc_stat->bc_fsm_state == BC_FSM_SINK_CDP_CONNECTED)
             {
-                gl_LedBlinkRate = LED_TIMER_PERIOD_CDP_SRC;
+                user_led->blinkRate = LED_TIMER_PERIOD_CDP_SRC;
+            }
+            else if (bc_stat->bc_fsm_state == BC_FSM_SINK_APPLE_BRICK_ID_DETECT)
+            {
+                user_led->blinkRate = LED_TIMER_PERIOD_APPLE_SRC;
+            }
+            else if (bc_stat->bc_fsm_state == BC_FSM_SINK_APPLE_BRICK_ID_DETECT)
+            {
+                user_led->blinkRate = LED_TIMER_PERIOD_APPLE_SRC;
             }
             else
 #endif /* BATTERY_CHARGING_ENABLE */
             {
-                gl_LedBlinkRate = LED_TIMER_PERIOD_TYPEC_SRC;
+                user_led->blinkRate = LED_TIMER_PERIOD_TYPEC_SRC;
             }
         }
     }
     else
     {
-        gl_LedBlinkRate = LED_TIMER_PERIOD_DETACHED;
+        user_led->blinkRate = LED_TIMER_PERIOD_DETACHED;
     }
 
-    Cy_PdUtils_SwTimer_Start (&gl_TimerCtx, callbackContext, id, gl_LedBlinkRate, led_timer_cb);
+    Cy_PdUtils_SwTimer_Start (&gl_TimerCtx, callbackContext, id, user_led->blinkRate, led_timer_cb);
 }
 #endif /* APP_FW_LED_ENABLE */
 
+/*******************************************************************************
+* Function Name: get_dpm_connect_stat
+********************************************************************************
+* Summary:
+*  Gets the DPM configuration for Port 0
+*
+* Parameters:
+*  None
+*
+* Return:
+*  cy_stc_pd_dpm_config_t
+*
+*******************************************************************************/
 cy_stc_pd_dpm_config_t* get_dpm_connect_stat(void)
 {
     return &(gl_PdStackPort0Ctx.dpmConfig);
 }
 
 #if PMG1_PD_DUALPORT_ENABLE
+/*******************************************************************************
+* Function Name: get_dpm_port1_connect_stat
+********************************************************************************
+* Summary:
+*  Gets the DPM configuration for Port 1
+*
+* Parameters:
+*  None
+*
+* Return:
+*  cy_stc_pd_dpm_config_t
+*
+*******************************************************************************/
 cy_stc_pd_dpm_config_t* get_dpm_port1_connect_stat()
 {
     return &(gl_PdStackPort1Ctx.dpmConfig);
@@ -333,25 +553,38 @@ cy_stc_pd_dpm_config_t* get_dpm_port1_connect_stat()
  */
 const cy_stc_pdstack_app_cbk_t app_callback =
 {
-    app_event_handler,
-    vconn_enable,
-    vconn_disable,
-    vconn_is_present,
-    vbus_is_present,
-    vbus_discharge_on,
-    vbus_discharge_off,
-    psnk_set_voltage,
-    psnk_set_current,
-    psnk_enable,
-    psnk_disable,
-    eval_src_cap,
-    eval_dr_swap,
-    eval_pr_swap,
-    eval_vconn_swap,
-    eval_vdm,
-    vbus_get_value,
+    .app_event_handler = Cy_App_EventHandler,
+    .vconn_enable = Cy_App_VconnEnable,
+    .vconn_disable = Cy_App_VconnDisable,
+    .vconn_is_present = Cy_App_VconnIsPresent,
+    .vbus_is_present = Cy_App_VbusIsPresent,
+    .vbus_discharge_on = Cy_App_VbusDischargeOn,
+    .vbus_discharge_off = Cy_App_VbusDischargeOff,
+    .psnk_set_voltage = Cy_App_Sink_SetVoltage,
+    .psnk_set_current = Cy_App_Sink_SetCurrent,
+    .psnk_enable = Cy_App_Sink_Enable,
+    .psnk_disable = Cy_App_Sink_Disable,
+    .eval_src_cap = Cy_App_Pdo_EvalSrcCap,
+    .eval_dr_swap = Cy_App_Swap_EvalDrSwap,
+    .eval_pr_swap = Cy_App_Swap_EvalPrSwap,
+    .eval_vconn_swap = Cy_App_Swap_EvalVconnSwap,
+    .eval_vdm = Cy_App_Vdm_EvalVdmMsg,
+    .vbus_get_value = Cy_App_VbusGetValue
 };
 
+/*******************************************************************************
+* Function Name: app_get_callback_ptr
+********************************************************************************
+* Summary:
+*  Returns pointer to the structure holding the application callback functions
+*
+* Parameters:
+*  context - PD Stack Context
+*
+* Return:
+*  cy_stc_pdstack_app_cbk_t
+*
+*******************************************************************************/
 cy_stc_pdstack_app_cbk_t* app_get_callback_ptr(cy_stc_pdstack_context_t * context)
 {
     (void)context;
@@ -359,6 +592,20 @@ cy_stc_pdstack_app_cbk_t* app_get_callback_ptr(cy_stc_pdstack_context_t * contex
     return ((cy_stc_pdstack_app_cbk_t *)(&app_callback));
 }
 
+/*******************************************************************************
+* Function Name: dpm_port0_rtos_sema_give
+********************************************************************************
+* Summary:
+*  Function releases the DPM Port-0 semaphore and returns the RTOS status code. 
+*  It is used by the PdStack middleware library.
+*
+* Parameters:
+*  context - PD Stack Context
+*
+* Return:
+*  RTOS status code
+*
+*******************************************************************************/
 int32_t dpm_port0_rtos_sema_give(cy_stc_pdstack_context_t * context)
 {
     (void)context;
@@ -366,6 +613,20 @@ int32_t dpm_port0_rtos_sema_give(cy_stc_pdstack_context_t * context)
     return xSemaphoreGive( gl_DpmPort0SemaHandle);
 }
 
+/*******************************************************************************
+* Function Name: dpm_port0_rtos_sema_give
+********************************************************************************
+* Summary:
+*  Function acquires the DPM Port-0 semamphore and returns the RTOS status code.
+*  It is used by the PdStack middleware library.
+*
+* Parameters:
+*  context - PD Stack Context
+*
+* Return:
+*  RTOS status code
+*
+*******************************************************************************/
 int32_t dpm_port0_rtos_sema_take(cy_stc_pdstack_context_t * context, uint32_t waitTick)
 {
     (void)context;
@@ -373,6 +634,7 @@ int32_t dpm_port0_rtos_sema_take(cy_stc_pdstack_context_t * context, uint32_t wa
     return xSemaphoreTake(gl_DpmPort0SemaHandle, waitTick);
 }
 
+/* RTOS callback structure for the PdStack middleware library. */
 cy_stc_pdstack_rtos_context_t gl_PdStackRtos0Ctx =
 {
     dpm_port0_rtos_sema_give,
@@ -380,6 +642,20 @@ cy_stc_pdstack_rtos_context_t gl_PdStackRtos0Ctx =
 };
 
 #if PMG1_PD_DUALPORT_ENABLE
+/*******************************************************************************
+* Function Name: dpm_port1_rtos_sema_give
+********************************************************************************
+* Summary:
+*  Function releases the DPM Port-1 semaphore and returns the RTOS status code. 
+*  It is used by the PdStack middleware library.
+*
+* Parameters:
+*  context - PD Stack Context
+*
+* Return:
+*  RTOS status code
+*
+*******************************************************************************/
 int32_t dpm_port1_rtos_sema_give(cy_stc_pdstack_context_t * context)
 {
     (void)context;
@@ -387,6 +663,20 @@ int32_t dpm_port1_rtos_sema_give(cy_stc_pdstack_context_t * context)
     return xSemaphoreGive( gl_DpmPort1SemaHandle);
 }
 
+/*******************************************************************************
+* Function Name: dpm_port1_rtos_sema_give
+********************************************************************************
+* Summary:
+*  Function acquires the DPM Port-1 semamphore and returns the RTOS status code.
+*  It is used by the PdStack middleware library.
+*
+* Parameters:
+*  context - PD Stack Context
+*
+* Return:
+*  RTOS status code
+*
+*******************************************************************************/
 int32_t dpm_port1_rtos_sema_take(cy_stc_pdstack_context_t * context, uint32_t waitTick)
 {
     (void)context;
@@ -394,14 +684,27 @@ int32_t dpm_port1_rtos_sema_take(cy_stc_pdstack_context_t * context, uint32_t wa
     return xSemaphoreTake(gl_DpmPort1SemaHandle, waitTick);
 }
 
+/* RTOS callback structure for the PdStack middleware library. */
 cy_stc_pdstack_rtos_context_t gl_PdStackRtos1Ctx =
 {
     dpm_port1_rtos_sema_give,
     dpm_port1_rtos_sema_take
 };
-#endif
+#endif /* PMG1_PD_DUALPORT_ENABLE*/
 
-
+/*******************************************************************************
+* Function Name: PdStack_Dpm_Port0_Task
+********************************************************************************
+* Summary:
+*  This task manages Port-0 Type-C and Power Delivery (PD) events and messages.
+*
+* Parameters:
+*  param - Pointer to the RTOS task context.
+*
+* Return:
+*  None.
+*
+*******************************************************************************/
 void PdStack_Dpm_Port0_Task (void *param)
 {
     (void) param;
@@ -431,6 +734,19 @@ void PdStack_Dpm_Port0_Task (void *param)
 }
 
 #if PMG1_PD_DUALPORT_ENABLE
+/*******************************************************************************
+* Function Name: PdStack_Dpm_Port1_Task
+********************************************************************************
+* Summary:
+*  This task manages Port-0 Type-C and Power Delivery (PD) events and messages.
+*
+* Parameters:
+*  param - Pointer to the RTOS task context.
+*
+* Return:
+*  None.
+*
+*******************************************************************************/
 void PdStack_Dpm_Port1_Task (void *param)
 {
     (void) param;
@@ -452,12 +768,27 @@ void PdStack_Dpm_Port1_Task (void *param)
             semaWaitTime = portMAX_DELAY;
         }
 
+        gl_DPMTaskCount++;
+
         /* Wait for semaphore for any event */
         xSemaphoreTake(gl_DpmPort1SemaHandle, semaWaitTime);
     }
 }
-#endif
+#endif /* PMG1_PD_DUALPORT_ENABLE */
 
+/*******************************************************************************
+* Function Name: App_Port0_Task
+********************************************************************************
+* Summary:
+*  Task performs any application specific task eg. Legacy charging on Port-0.
+*
+* Parameters:
+*  param - Pointer to the RTOS task context.
+*
+* Return:
+*  None.
+*
+*******************************************************************************/
 void App_Port0_Task(void *param)
 {
     (void) param;
@@ -465,10 +796,10 @@ void App_Port0_Task(void *param)
     for(;;)
     {
         /* Wait for charger detect events*/
-        if(true == chgdet_rtos_event_wait(&gl_PdStackPort0Ctx))
+        if(true == Cy_App_GetRtosEvent(&gl_PdStackPort0Ctx, CY_RTOS_NEVER_TIMEOUT))
         {
             /* Perform any application level tasks. */
-            app_task(&gl_PdStackPort0Ctx);
+            Cy_App_Task(&gl_PdStackPort0Ctx);
 
             gl_APPTaskCount++;
         }
@@ -476,103 +807,188 @@ void App_Port0_Task(void *param)
 }
 
 #if PMG1_PD_DUALPORT_ENABLE
+/*******************************************************************************
+* Function Name: App_Port1_Task
+********************************************************************************
+* Summary:
+*  Task performs any application specific task eg. Legacy charging on Port-0.
+*
+* Parameters:
+*  param - Pointer to the RTOS task context.
+*
+* Return:
+*  None.
+*
+*******************************************************************************/
 void App_Port1_Task(void *param)
 {
     (void) param;
     for(;;)
     {
         /* Wait for charger detect events*/
-        if(true == chgdet_rtos_event_wait(&gl_PdStackPort1Ctx))
+        if(true == Cy_App_GetRtosEvent(&gl_PdStackPort1Ctx, CY_RTOS_NEVER_TIMEOUT))
         {
             /* Perform any application level tasks. */
-            app_task(&gl_PdStackPort1Ctx);
+            Cy_App_Task(&gl_PdStackPort1Ctx);
+
+            gl_APPTaskCount++;
         }
     }
 }
-#endif
+#endif /* PMG1_PD_DUALPORT_ENABLE */
 
-void FaultHandler_Port0_Task(void *param)
-{
-    (void) param;
-
-    for(;;)
-    {
-        /* Wait for fault events */
-        if(true == fault_rtos_event_wait(&gl_PdStackPort0Ctx))
-        {
-            /* Perform tasks associated with instrumentation. */
-            app_fault_handler_task(&gl_PdStackPort0Ctx);
-
-            gl_FaultTaskCount++;
-        }
-    }
-}
-
-#if PMG1_PD_DUALPORT_ENABLE
-void FaultHandler_Port1_Task(void *param)
-{
-    (void) param;
-    for(;;)
-    {
-        /* Wait for fault events */
-        if(true == fault_rtos_event_wait(&gl_PdStackPort1Ctx))
-        {
-            /* Perform tasks associated with instrumentation. */
-            app_fault_handler_task(&gl_PdStackPort1Ctx);
-        }
-    }
-}
-#endif
-
+/*******************************************************************************
+* Function Name: Instrumentation_Task
+********************************************************************************
+* Summary:
+*  Task performs any system instrumentation and system task eg. Stack Monitoring.
+*
+* Parameters:
+*  param - Pointer to the RTOS task context.
+*
+* Return:
+*  None.
+*
+*******************************************************************************/
 void Instrumentation_Task(void *param)
 {
     (void) param;
     char string[32];
     size_t stringSize = 0;
-    uint32_t preAppTaskCount = 0;
-    uint32_t preDpmTaskCount = 0;
-    uint32_t preFaultTaskCount = 0;
+    int32_t timeOut = UART_TIMEOUT_COUNT;
+
     for(;;)
     {
+        /* Wait for semaphore to get timeout or get an event. */
+        xSemaphoreTake(gl_InstSemaHandle, pdMS_TO_TICKS(INST_TASK_DELAY_MS));
+
         /* Perform tasks associated with instrumentation. */
-        instrumentation_task();
+        Cy_App_Instrumentation_Task();
 
-        if((preAppTaskCount != gl_APPTaskCount) || (preDpmTaskCount != gl_DPMTaskCount)
-                || (preFaultTaskCount != gl_FaultTaskCount))
+        if((gl_preAppTaskCount != gl_APPTaskCount) || (gl_preDpmTaskCount != gl_DPMTaskCount))
         {
-            stringSize = snprintf(string, 32, "A:%u D:%u F:%u", (unsigned int)gl_APPTaskCount,
-                                            (unsigned int)gl_DPMTaskCount, (unsigned int)gl_FaultTaskCount);
-            (void)stringSize;
-            
-            Cy_SCB_UART_PutString(CYBSP_UART_HW, string);
-            
-            Cy_SCB_UART_PutString(CYBSP_UART_HW, (void *)"\r\n");
+            stringSize = snprintf(string, 32, "App:%u Dpm:%u\r\n",
+                                  (unsigned int)gl_APPTaskCount,
+                                  (unsigned int)gl_DPMTaskCount);
 
-            preAppTaskCount = gl_APPTaskCount;
-            preDpmTaskCount = gl_DPMTaskCount;
-            preFaultTaskCount = gl_FaultTaskCount;
+            Cy_SCB_UART_PutArrayBlocking(CYBSP_UART_HW, string, stringSize);
+
+            timeOut = UART_TIMEOUT_COUNT;
+            while((!Cy_SCB_UART_IsTxComplete(CYBSP_UART_HW)) && (--timeOut > 0));
+
+            /* Store the previous count. */
+            gl_preAppTaskCount = gl_APPTaskCount;
+            gl_preDpmTaskCount = gl_DPMTaskCount;
         }
-
-        /* Given 100 ms delay for instrumentation task*/
-        vTaskDelay(pdMS_TO_TICKS(INST_TASK_DELAY_MS));
     }
 }
 
-
+/*******************************************************************************
+* Function Name: vApplicationIdleHook
+********************************************************************************
+* Summary:
+*  Function will execute as an idle task and performs the system sleep operations.
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None.
+*
+*******************************************************************************/
 void vApplicationIdleHook()
 {
 #if SYS_DEEPSLEEP_ENABLE
     /* If possible, enter deep sleep mode for power saving. */
-    system_sleep(&gl_PdStackPort0Ctx,
+    Cy_App_SystemSleep(&gl_PdStackPort0Ctx,
 #if PMG1_PD_DUALPORT_ENABLE
                 &gl_PdStackPort1Ctx
 #else
                 NULL
 #endif /* PMG1_PD_DUALPORT_ENABLE */
                 );
+    /* Since the SysTick will be disabled during the deep sleep, send a event to
+     * the instrumentation task to exit from the block state to avoid the watchdog reset.
+     */
+    xSemaphoreGive(gl_InstSemaHandle);
 #endif /* SYS_DEEPSLEEP_ENABLE */
 }
 
+/*******************************************************************************
+* Function Name: soln_sink_fet_off
+********************************************************************************
+* Summary:
+*  Turns off the consumer FET
+*
+* Parameters:
+*  context - PD Stack Context
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+void soln_sink_fet_off(cy_stc_pdstack_context_t * context)
+{
+#if CY_APP_SINK_FET_CTRL_GPIO_EN
+    if (context->port == 0u)
+    {
+        Cy_GPIO_Clr (PFET_SNK_CTRL_P0_PORT, PFET_SNK_CTRL_P0_PIN);
+    }
+#if PMG1_PD_DUALPORT_ENABLE
+    else
+    {
+        Cy_GPIO_Clr (PFET_SNK_CTRL_P1_PORT, PFET_SNK_CTRL_P1_PIN);
+    }
+#endif /* PMG1_PD_DUALPORT_ENABLE */
+#endif /* CY_APP_SINK_FET_CTRL_GPIO_EN */
+}
+
+/*******************************************************************************
+* Function Name: soln_sink_fet_on
+********************************************************************************
+* Summary:
+*  Turns on the consumer FET
+*
+* Parameters:
+*  context - PD Stack Context
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+void soln_sink_fet_on(cy_stc_pdstack_context_t * context)
+{
+#if CY_APP_SINK_FET_CTRL_GPIO_EN
+    if (context->port == 0u)
+    {
+        Cy_GPIO_Set (PFET_SNK_CTRL_P0_PORT, PFET_SNK_CTRL_P0_PIN);
+    }
+#if PMG1_PD_DUALPORT_ENABLE
+    else
+    {
+        Cy_GPIO_Set (PFET_SNK_CTRL_P1_PORT, PFET_SNK_CTRL_P1_PIN);
+    }
+#endif /* PMG1_PD_DUALPORT_ENABLE */
+#endif /* CY_APP_SINK_FET_CTRL_GPIO_EN */
+}
+
+/*******************************************************************************
+* Function Name: main
+********************************************************************************
+* Summary:
+*  System entrance point. This function performs
+*  - Initial setup of device
+*  - Enables Watchdog timer, USB PD Port 0 and Port 1 interrupt
+*  - Initializes USBPD block and PDStack
+*  - Starts the Scheduler
+*
+* Parameters:
+*  None
+*
+* Return:
+*  int
+*
+*******************************************************************************/
 int main(void)
 {
     cy_rslt_t result;
@@ -580,6 +996,7 @@ int main(void)
     cy_stc_scb_uart_context_t CYBSP_UART_context;
 
     const char string[] = "Scheduler Started\r\n";
+
     /* Initialize the device and board peripherals */
     result = cybsp_init() ;
     if (result != CY_RSLT_SUCCESS)
@@ -587,8 +1004,7 @@ int main(void)
         CY_ASSERT(0);
     }
 
-    /*
-     * Register the interrupt handler for the watchdog timer. This timer is used to
+    /* Register the interrupt handler for the watchdog timer. This timer is used to
      * implement the soft timers required by the USB-PD Stack.
      */
     Cy_SysInt_Init(&wdt_interrupt_config, &wdt_interrupt_handler);
@@ -600,20 +1016,34 @@ int main(void)
     /* Initialize the soft timer module. */
     Cy_PdUtils_SwTimer_Init(&gl_TimerCtx, &timerConfig);
 
-    xTaskCreate(Instrumentation_Task, "Instrumentation Task", (configMINIMAL_STACK_SIZE*2) , NULL, 1 , &gl_InstTaskHandle) ;
-    xTaskCreate(PdStack_Dpm_Port0_Task, "DPM Port0 Task", configMINIMAL_STACK_SIZE , NULL, 1 , &gl_DpmPort0TaskHandle) ;
-    xTaskCreate(App_Port0_Task, "APP Port0 Task", configMINIMAL_STACK_SIZE , NULL, 1 , &gl_AppPort0TaskHandle) ;
+    /* Create instrumentation task. */
+    xTaskCreate(Instrumentation_Task, "Instrumentation Task", INST_TASK_STACK_SIZE , NULL, INST_TASK_PRIORITY , &gl_InstTaskHandle) ;
 
-#if (VBUS_OVP_ENABLE || VBUS_UVP_ENABLE)
-    xTaskCreate(FaultHandler_Port0_Task, "Fault Port0 Task", configMINIMAL_STACK_SIZE , NULL, 1 , &gl_FaultPort0TaskHandle) ;
-#endif
+    /* Create DPM task for the port-0. */
+    xTaskCreate(PdStack_Dpm_Port0_Task, "DPM Port0 Task", DPM_TASK_STACK_SIZE , NULL, DPM_TASK_PRIORITY , &gl_DpmPort0TaskHandle) ;
+
+    /* Create application task for the port-0. */
+    xTaskCreate(App_Port0_Task, "APP Port0 Task", APP_TASK_STACK_SIZE , NULL, APP_TASK_PRIORITY , &gl_AppPort0TaskHandle) ;
+
 
 #if PMG1_PD_DUALPORT_ENABLE
-    xTaskCreate(PdStack_Dpm_Port1_Task, "DPM Port1 Task", configMINIMAL_STACK_SIZE , NULL, 1 , &gl_DPMPort1TaskHandle) ;
-    xTaskCreate(App_Port1_Task, "APP Port1 Task", configMINIMAL_STACK_SIZE , NULL, 1 , &gl_AppPort1TaskHandle) ;
-    xTaskCreate(FaultHandler_Port1_Task, "Fault Port1 Task", configMINIMAL_STACK_SIZE , NULL, 1 , &gl_FaultPort1TaskHandle) ;
-#endif //PMG1_PD_DUALPORT_ENABLE
+    /* Create DPM task for the port-1. */
+    xTaskCreate(PdStack_Dpm_Port1_Task, "DPM Port1 Task", DPM_TASK_STACK_SIZE , NULL, DPM_TASK_PRIORITY , &gl_DpmPort1TaskHandle) ;
 
+    /* Create application task for the port-1. */
+    xTaskCreate(App_Port1_Task, "APP Port1 Task", APP_TASK_STACK_SIZE , NULL, APP_TASK_PRIORITY , &gl_AppPort1TaskHandle) ;
+#endif /* PMG1_PD_DUALPORT_ENABLE */
+
+    /* Create a counting semaphore for the instrumentation task.
+     * This is used for running the instrumentation task periodically.*/
+    gl_InstSemaHandle = xSemaphoreCreateCounting(32, 0);
+    if(NULL == gl_InstSemaHandle)
+    {
+        CY_ASSERT(0);
+    }
+
+    /* Create a counting semaphore for the USB-PD and Type-C event notification.
+     * This is used for sending an event to the Port-0 DPM task.*/
     gl_DpmPort0SemaHandle = xSemaphoreCreateCounting(32, 0);
     if(NULL == gl_DpmPort0SemaHandle)
     {
@@ -621,6 +1051,8 @@ int main(void)
     }
 
 #if PMG1_PD_DUALPORT_ENABLE
+    /* Create a counting semaphore for the USB-PD and Type-C event notification.
+     * This is used for sending an event to the Port-1 DPM task.*/
     gl_DpmPort1SemaHandle = xSemaphoreCreateCounting(32, 0);
     if(NULL == gl_DpmPort1SemaHandle)
     {
@@ -636,12 +1068,12 @@ int main(void)
     __enable_irq();
 
     /* Initialize the instrumentation related data structures. */
-    instrumentation_init();
+    Cy_App_Instrumentation_Init(&gl_TimerCtx);
 
     /* Register callback function to be executed when instrumentation fault occurs. */
-    instrumentation_register_cb((instrumentation_cb_t)instrumentation_cb);
+    Cy_App_Instrumentation_RegisterCb((cy_app_instrumentation_cb_t)instrumentation_cb);
 
-    /* Configure and enable the USBPD interrupts */
+    /* Configure and enable the USBPD interrupts for Port-0*/
     Cy_SysInt_Init(&usbpd_port0_intr0_config, &cy_usbpd0_intr0_handler);
     NVIC_EnableIRQ(usbpd_port0_intr0_config.intrSrc);
 
@@ -649,7 +1081,7 @@ int main(void)
     NVIC_EnableIRQ(usbpd_port0_intr1_config.intrSrc);
 
 #if PMG1_PD_DUALPORT_ENABLE
-    /* Configure and enable the USBPD interrupts for Port #1. */
+    /* Configure and enable the USBPD interrupts for Port-1. */
     Cy_SysInt_Init(&usbpd_port1_intr0_config, &cy_usbpd1_intr0_handler);
     NVIC_EnableIRQ(usbpd_port1_intr0_config.intrSrc);
 
@@ -668,22 +1100,21 @@ int main(void)
     Cy_USBPD_Init(&gl_UsbPdPort1Ctx, 1, mtb_usbpd_port1_HW, mtb_usbpd_port1_HW_TRIM,
             (cy_stc_usbpd_config_t *)&mtb_usbpd_port1_config, get_dpm_port1_connect_stat);
 #endif /* PMG1_PD_DUALPORT_ENABLE */
-#endif
+#endif /* defined(CY_DEVICE_CCG3) */
 
-    /* Initialize the Device Policy Manager. */
+    /* Initialize the Device Policy Manager for Port-0. */
     Cy_PdStack_Dpm_Init(&gl_PdStackPort0Ctx,
                        &gl_UsbPdPort0Ctx,
                        &mtb_usbpd_port0_pdstack_config,
                        app_get_callback_ptr(&gl_PdStackPort0Ctx),
                        &pdstack_port0_dpm_params,
-                       &gl_TimerCtx
-                       );
+                       &gl_TimerCtx);
 
     Cy_PdStack_Dpm_Rtos_Init(&gl_PdStackPort0Ctx,
-                        &gl_PdStackRtos0Ctx
-                                 );
+                        &gl_PdStackRtos0Ctx);
 
 #if PMG1_PD_DUALPORT_ENABLE
+    /* Initialize the Device Policy Manager for Port-1. */
     Cy_PdStack_Dpm_Init(&gl_PdStackPort1Ctx,
                        &gl_UsbPdPort1Ctx,
                        &mtb_usbpd_port1_pdstack_config,
@@ -692,26 +1123,26 @@ int main(void)
                        &gl_TimerCtx);
 
     Cy_PdStack_Dpm_Rtos_Init(&gl_PdStackPort1Ctx,
-                        &gl_PdStackRtos1Ctx
-                                 );
+                        &gl_PdStackRtos1Ctx);
 #endif /* PMG1_PD_DUALPORT_ENABLE */
 
     /* Perform application level initialization. */
-    app_init(&gl_PdStackPort0Ctx);
+    Cy_App_Init(&gl_PdStackPort0Ctx, &port0_app_params);
 #if PMG1_PD_DUALPORT_ENABLE
-    app_init(&gl_PdStackPort1Ctx);
+    Cy_App_Init(&gl_PdStackPort1Ctx, &port1_app_params);
 #endif /* PMG1_PD_DUALPORT_ENABLE */
 
     /* Initialize the fault configuration values */
-    fault_handler_init_vars(&gl_PdStackPort0Ctx);
+    Cy_App_Fault_InitVars(&gl_PdStackPort0Ctx);
 #if PMG1_PD_DUALPORT_ENABLE
-    fault_handler_init_vars(&gl_PdStackPort1Ctx);
+    Cy_App_Fault_InitVars(&gl_PdStackPort1Ctx);
 #endif /* PMG1_PD_DUALPORT_ENABLE */
 
     /* Start any timers or tasks associated with application instrumentation. */
-    instrumentation_start();
+    Cy_App_Instrumentation_Start();
 
-    /* Start the device policy manager operation. This will initialize the USB-PD block and enable connect detection. */
+    /* Start the device policy manager operation. This will initialize the
+     * USB-PD block and enable connect detection. */
     Cy_PdStack_Dpm_Start(&gl_PdStackPort0Ctx);
 #if PMG1_PD_DUALPORT_ENABLE
     Cy_PdStack_Dpm_Start(&gl_PdStackPort1Ctx);
@@ -719,8 +1150,13 @@ int main(void)
 
 #if APP_FW_LED_ENABLE
     /* Start a timer that will blink the FW ACTIVE LED. */
-    Cy_PdUtils_SwTimer_Start (&gl_TimerCtx, (void *)&gl_PdStackPort0Ctx, (cy_timer_id_t)LED_TIMER_ID,
-            gl_LedBlinkRate, led_timer_cb);
+    Cy_PdUtils_SwTimer_Start (&gl_TimerCtx, (void *)&gl_PdStackPort0Ctx, (cy_timer_id_t)LED1_TIMER_ID,
+            LED_TIMER_PERIOD_DETACHED, led_timer_cb);
+#if PMG1_PD_DUALPORT_ENABLE
+    /* Start a timer that will blink the FW ACTIVE LED. */
+    Cy_PdUtils_SwTimer_Start (&gl_TimerCtx, (void *)&gl_PdStackPort1Ctx, (cy_timer_id_t)LED2_TIMER_ID,
+            LED_TIMER_PERIOD_DETACHED, led_timer_cb);
+#endif /* PMG1_PD_DUALPORT_ENABLE */
 #endif /* APP_FW_LED_ENABLE */
 
     /*
